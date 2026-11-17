@@ -28,7 +28,7 @@
 - [x] 3.6 Add removal for named profiles behind a confirmation, with built-in providers excluded; verify UI tests cover confirm, cancel, and built-in rows without a remove action
 - [x] 3.7 Make the surface read-only with configuration guidance for remote/SSH runtimes; verify a UI test asserts configuration actions are unavailable and guidance renders
 - [ ] 3.8 Apply the project visual rules to new rows, pills, and dialogs (fully rounded pills, subtle row fill, no decorative dots), and verify with `python3 scripts/screenshot.py target/ui-review.png` using the provider fixture
-- [ ] 3.9 Commit and push the Desktop changes; verify `git status` is clean, the pushed branch matches the local tip, and CI-required checks are unaffected
+- [x] 3.9 Commit and push the Desktop changes; verify `git status` is clean, the pushed branch matches the local tip, and CI-required checks are unaffected
 
 ## 4. Integration verification
 
