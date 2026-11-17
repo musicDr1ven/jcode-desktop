@@ -827,6 +827,22 @@ impl PromptInput {
         provider_route_spec_in(&self.model_details, provider, current)
     }
 
+    /// A spec for a runtime provider entry, including named profiles whose
+    /// routes use `openai-compatible:<id>` and display-name providers.
+    pub(crate) fn provider_route_spec_for(
+        &self,
+        provider_id: &str,
+        display_name: &str,
+        current: Option<&str>,
+    ) -> Option<String> {
+        provider_route_spec_matching(
+            &self.model_details,
+            &provider_route_methods_for(provider_id, display_name),
+            provider_id,
+            current,
+        )
+    }
+
     fn build_command_suggestions(&self) -> Vec<CommandSuggestion> {
         if !self.command_completion {
             return Vec::new();
@@ -3613,7 +3629,27 @@ fn provider_route_spec_in(
     provider: &str,
     current: Option<&str>,
 ) -> Option<String> {
-    let wanted = provider_route_methods(provider);
+    provider_route_spec_matching(details, &provider_route_methods(provider), provider, current)
+}
+
+fn provider_route_methods_for(provider: &str, display_name: &str) -> Vec<String> {
+    let mut wanted = provider_route_methods(provider);
+    let id = provider.trim().to_ascii_lowercase();
+    let display_slug = display_name.trim().to_ascii_lowercase().replace([' ', '/', '·'], "-");
+    for candidate in [display_slug, format!("openai-compatible:{id}")] {
+        if !candidate.is_empty() && !wanted.contains(&candidate) {
+            wanted.push(candidate);
+        }
+    }
+    wanted
+}
+
+fn provider_route_spec_matching(
+    details: &HashMap<String, model_menu::ModelDetails>,
+    wanted: &[String],
+    provider: &str,
+    current: Option<&str>,
+) -> Option<String> {
     let mut matches: Vec<_> = details
         .iter()
         .filter(|(_, detail)| {

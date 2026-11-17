@@ -77,6 +77,10 @@ pub struct LoginInput {
     pub focus_handle: FocusHandle,
     secret: Secret,
     placeholder: SharedString,
+    /// Secret fields mask every glyph; plain fields are ordinary text.
+    masked: bool,
+    /// Distinguishes several fields rendered in one dialog.
+    element_id: Option<SharedString>,
     last_layout: Option<WrappedLine>,
     last_bounds: Option<Bounds<Pixels>>,
 }
@@ -86,9 +90,29 @@ impl LoginInput {
             focus_handle: cx.focus_handle(),
             secret: Secret::default(),
             placeholder: placeholder.into().into(),
+            masked: true,
+            element_id: None,
             last_layout: None,
             last_bounds: None,
         }
+    }
+
+    /// A visible single-line field for non-secret values such as a base URL.
+    pub fn new_plain(cx: &mut Context<Self>, placeholder: impl Into<String>) -> Self {
+        let mut input = Self::new(cx, placeholder);
+        input.masked = false;
+        input
+    }
+
+    /// Give the field a stable element id inside a form.
+    pub fn with_element_id(mut self, id: impl Into<SharedString>) -> Self {
+        self.element_id = Some(id.into());
+        self
+    }
+
+    /// Current text, for validation before submit.
+    pub fn text(&self) -> &str {
+        &self.secret.text
     }
     pub fn content_empty(&self) -> bool {
         self.secret.text.is_empty()
@@ -394,10 +418,14 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content: SharedString = input.secret.masked().into();
-        let selected_range = input.secret.utf16(input.secret.selection.start) * "•".len()
-            ..input.secret.utf16(input.secret.selection.end) * "•".len();
-        let cursor = input.secret.utf16(input.secret.cursor()) * "•".len();
+        let (content, unit): (SharedString, usize) = if input.masked {
+            (input.secret.masked().into(), "•".len())
+        } else {
+            (input.secret.text.clone().into(), 1)
+        };
+        let selected_range = input.secret.utf16(input.secret.selection.start) * unit
+            ..input.secret.utf16(input.secret.selection.end) * unit;
+        let cursor = input.secret.utf16(input.secret.cursor()) * unit;
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
@@ -502,7 +530,10 @@ impl Render for LoginInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _render_scope = crate::render_stats::scope("LoginInput");
         div()
-            .id("login-input")
+            .id(self
+                .element_id
+                .clone()
+                .unwrap_or_else(|| "login-input".into()))
             .key_context("LoginInput")
             .track_focus(&self.focus_handle)
             .w_full()
@@ -532,6 +563,37 @@ impl Render for LoginInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn plain_input_shows_text_unmasked_and_takes_value(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(gpui::WindowOptions::default(), |_, cx| {
+                cx.new(|cx| {
+                    LoginInput::new_plain(cx, "https://llm.example.com/v1")
+                        .with_element_id("provider-add-base")
+                })
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |input, window, cx| {
+                window.focus(&input.focus_handle, cx)
+            })
+            .unwrap();
+        cx.simulate_input(*window, "https://llm.example.com/v1");
+        cx.run_until_parked();
+        window
+            .update(cx, |input, _, cx| {
+                assert_eq!(input.text(), "https://llm.example.com/v1");
+                assert_eq!(
+                    input.last_layout.as_ref().unwrap().text.as_ref(),
+                    "https://llm.example.com/v1"
+                );
+                assert_eq!(input.take(cx), "https://llm.example.com/v1");
+                assert!(input.text().is_empty());
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn native_input_masks_layout_and_readback_and_clears(cx: &mut gpui::TestAppContext) {
         let window = cx.update(|cx| {

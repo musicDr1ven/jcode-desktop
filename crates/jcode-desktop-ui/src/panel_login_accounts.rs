@@ -1176,6 +1176,121 @@ impl Panel {
         group.into_any_element()
     }
 
+    /// One row for a runtime provider entry. Owned identity, so named
+    /// profiles and providers outside the sign-in catalog can render.
+    pub(super) fn render_provider_entry_row(
+        &self,
+        entry: &crate::providers::ProviderEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = Theme::global();
+        let ink = if entry.available() {
+            theme.TEXT
+        } else {
+            theme.TEXT_DIM
+        };
+        let selector = format!("provider-entry-{}", entry.id);
+        let logo: gpui::AnyElement = match crate::accounts::logo(&entry.id) {
+            Some(bytes) => gpui::svg()
+                .data(bytes)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(ink)
+                .into_any_element(),
+            None => div()
+                .size(px(16.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(theme.INLINE_CODE_BG)
+                .text_size(px(10.0))
+                .text_color(ink)
+                .child(crate::accounts::lettermark(&entry.display_name))
+                .into_any_element(),
+        };
+        let models = entry.available_model_count();
+        let model_text = match models {
+            0 => "No usable model".to_string(),
+            1 => "1 model".to_string(),
+            count => format!("{count} models"),
+        };
+        let mut row = div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector({
+                let selector = selector.clone();
+                move || selector
+            })
+            .mx_2()
+            .px_3()
+            .py_2()
+            .rounded_full()
+            .bg(theme.HEADER_BG)
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme.PANEL_BORDER))
+            .child(logo)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(16.0))
+                            .line_height(px(16.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .text_color(ink)
+                                    .child(entry.display_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.TEXT_DIM)
+                                    .child(entry.auth_kind.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(13.0))
+                            .text_color(theme.TEXT_DIM)
+                            .child(format!("{} · {model_text}", entry.status_label())),
+                    ),
+            );
+        if entry.available() && models > 0 {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .bg(theme.ACCENT.opacity(0.18))
+                    .text_size(px(11.0))
+                    .text_color(theme.ACCENT)
+                    .child("Use"),
+            );
+        }
+        let entry = entry.clone();
+        row.on_click(cx.listener(move |this, _, window, cx| {
+            this.select_provider_entry(&entry, window, cx);
+        }))
+        .into_any_element()
+    }
+
     pub(super) fn render_account_catalog(
         &self,
         providers: &[LoginProvider],

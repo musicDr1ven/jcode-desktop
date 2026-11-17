@@ -6960,12 +6960,46 @@ impl Workspace {
             .py_1()
             .child(
                 div()
-                    .flex_none()
+                    .flex()
+                    .items_center()
                     .px_4()
                     .pb(px(2.0))
+                    .gap_2()
                     .text_size(px(10.0))
                     .text_color(Theme::global().TEXT_DIM)
-                    .child("accounts"),
+                    .child(div().flex_1().child("accounts"))
+                    .child(
+                        div()
+                            .id("accounts-manage-providers")
+                            .debug_selector(|| "accounts-manage-providers".into())
+                            .flex_none()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(Theme::global().ACCENT.opacity(0.14))
+                            .text_color(Theme::global().ACCENT)
+                            .cursor_pointer()
+                            .hover(|el| el.bg(Theme::global().ACCENT.opacity(0.26)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let Some(source) = this
+                                    .slots
+                                    .get(this.active)
+                                    .filter(|slot| !slot.closing)
+                                    .map(|slot| slot.panel.entity_id())
+                                else {
+                                    return;
+                                };
+                                this.open_accounts(
+                                    &OpenAccounts {
+                                        source,
+                                        login_command: None,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }))
+                            .child("providers"),
+                    ),
             );
 
         let active = self.slots.get(self.active).and_then(|slot| {

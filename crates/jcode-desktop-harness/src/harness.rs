@@ -2084,6 +2084,7 @@ fn session_worker_with_connector(
         let _ = updates.send(Update::SessionConnected {
             session_id: session_id.clone(),
         });
+        crate::providers::set_provider_admin_supported(client.supports("provider_admin"));
 
         let mut history = history::HistoryRecovery::default();
         history.load(&client, real_id, &session_id, &updates);

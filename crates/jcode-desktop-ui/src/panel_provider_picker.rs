@@ -89,12 +89,32 @@ impl Panel {
                 .contains(query.trim())
             })
             .collect();
+        // Providers outside the sign-in catalog (OpenCode Go, named
+        // OpenAI-compatible profiles) still have accounts and routes. Show
+        // every connected one, not just catalog entries.
+        let covered: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.provider.id).collect();
+        let entries: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|entry| entry.available() && entry.available_model_count() > 0)
+            .filter(|entry| !covered.contains(entry.id.as_str()))
+            .filter(|entry| {
+                format!(
+                    "{} {} {}",
+                    entry.display_name, entry.id, entry.auth_kind
+                )
+                .to_lowercase()
+                .contains(query.trim())
+            })
+            .cloned()
+            .collect();
         let visible = Rc::new(Vec::new());
         let remote = self.login_is_remote();
         let mut body = div().flex().flex_col().gap_2();
         if remote {
             body = body.child("Select a remote provider through the model picker. Local sign-ins are not available on this machine.");
-        } else if rows.is_empty() {
+        } else if rows.is_empty() && entries.is_empty() {
             body = body.child(
                 if state.status_loading || state.accounts.accounts.is_none() {
                     "Loading providers…"
@@ -107,6 +127,9 @@ impl Panel {
         } else {
             for row in &rows {
                 body = body.child(self.render_account_row(row, None, &visible, None, cx));
+            }
+            for entry in &entries {
+                body = body.child(self.render_provider_entry_row(entry, cx));
             }
         }
         if let Some(error) = &state.error {
@@ -141,6 +164,20 @@ impl Panel {
                                 .text_color(theme.TEXT)
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child("Select provider"),
+                        )
+                        .child(
+                            login_button("provider-picker-manage", "Manage providers…").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_login_picker(cx);
+                                    window.dispatch_action(
+                                        Box::new(crate::ui_actions::OpenAccounts {
+                                            source: cx.entity_id(),
+                                            login_command: None,
+                                        }),
+                                        cx,
+                                    );
+                                }),
+                            ),
                         )
                         .child(login_button("provider-picker-close", "Close").on_click(
                             cx.listener(|this, _, window, cx| {

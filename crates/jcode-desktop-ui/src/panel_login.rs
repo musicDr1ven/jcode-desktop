@@ -48,6 +48,12 @@ pub(super) struct LoginState {
     search: Entity<PromptInput>,
     usage: Option<catalog::MethodUsage>,
     accounts: accounts::AccountsData,
+    /// Runtime provider inventory (accounts merged with model routes).
+    entries: Vec<crate::providers::ProviderEntry>,
+    /// Open add-provider form, key prompt, or removal confirmation.
+    add_provider: Option<AddProviderState>,
+    key_provider: Option<ProviderKeyState>,
+    remove_provider: Option<String>,
     accounts_task: Option<Task<()>>,
     /// Provider ids with a live smoke test in flight.
     live_testing: std::collections::HashSet<String>,
@@ -56,6 +62,28 @@ pub(super) struct LoginState {
     /// Failure reasons from the most recent live test, by provider id.
     live_errors: HashMap<String, String>,
     live_tasks: Vec<Task<()>>,
+}
+
+/// Inline add-provider form. Values live in the input entities so validation
+/// reads exactly what the user sees.
+pub(super) struct AddProviderState {
+    pub name: Entity<LoginInput>,
+    pub base_url: Entity<LoginInput>,
+    pub model: Entity<LoginInput>,
+    pub context_window: Entity<LoginInput>,
+    pub api_key_env: Entity<LoginInput>,
+    pub api_key: Entity<LoginInput>,
+    pub no_api_key: bool,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+/// Inline "set API key" prompt for any provider, including named profiles.
+pub(super) struct ProviderKeyState {
+    pub provider: String,
+    pub display_name: String,
+    pub busy: bool,
+    pub error: Option<String>,
 }
 
 impl Drop for LoginState {
@@ -181,6 +209,10 @@ impl Panel {
             search,
             usage: None,
             accounts: accounts::AccountsData::default(),
+            entries: Vec::new(),
+            add_provider: None,
+            key_provider: None,
+            remove_provider: None,
             accounts_task: None,
             live_testing: Default::default(),
             live_test_all: false,
@@ -253,12 +285,17 @@ impl Panel {
         state.accounts_task = Some(cx.spawn(async move |this, cx| {
             let data = accounts_task.await;
             let _ = this.update(cx, |panel, cx| {
+                let mut data = data;
+                let providers = panel
+                    .login
+                    .as_ref()
+                    .map(|state| state.providers.clone())
+                    .unwrap_or_default();
+                data.resolve_default(&providers);
                 if let Some(state) = panel.login.as_mut() {
-                    let mut data = data;
-                    data.resolve_default(&state.providers);
                     state.accounts = data;
-                    cx.notify();
                 }
+                panel.rebuild_provider_entries(cx);
             });
         }));
         let provider_ids: Vec<_> = state
@@ -417,6 +454,72 @@ impl Panel {
         true
     }
 
+    /// Runtime context that decides which provider actions are safe.
+    fn inventory_context(&self) -> crate::providers::InventoryContext {
+        crate::providers::InventoryContext::current(
+            !self.login_is_remote(),
+            crate::providers::provider_admin_supported(),
+        )
+    }
+
+    /// Merge the fetched accounts with the last known runtime routes.
+    fn provider_inventory(&self) -> Vec<crate::providers::ProviderEntry> {
+        let Some(state) = self.login.as_ref() else {
+            return Vec::new();
+        };
+        let Some(accounts) = state.accounts.accounts.as_ref() else {
+            return Vec::new();
+        };
+        crate::providers::inventory(accounts, &self.routes, &self.inventory_context())
+    }
+
+    /// Recompute provider rows after accounts, routes, or credentials change.
+    pub(super) fn rebuild_provider_entries(&mut self, cx: &mut Context<Self>) {
+        let entries = self.provider_inventory();
+        if let Some(state) = self.login.as_mut() {
+            state.entries = entries;
+        }
+        cx.notify();
+    }
+
+    /// Switch to a provider from the runtime inventory (catalog entries and
+    /// named profiles alike), using the runtime's routing policy.
+    pub(super) fn select_provider_entry(
+        &mut self,
+        entry: &crate::providers::ProviderEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let spec = self.input.read(cx).provider_route_spec_for(
+            &entry.id,
+            &entry.display_name,
+            self.model.as_deref(),
+        );
+        let Some(spec) = spec else {
+            if let Some(state) = self.login.as_mut() {
+                state.error = Some(format!(
+                    "{} has no available model for this session.",
+                    entry.display_name
+                ));
+            }
+            cx.notify();
+            return;
+        };
+        self.close_login_picker(cx);
+        if self.preview_state.is_none() {
+            self.bridge.send(Command::SetModel {
+                session_id: self.session_id.clone(),
+                model: spec,
+            });
+        }
+        self.items.push(Item::Assistant(format!(
+            "Switching provider to {}…",
+            entry.display_name
+        )));
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
     fn select_login_provider(&mut self, provider: LoginProvider, cx: &mut Context<Self>) {
         self.select_login_provider_for(provider, None, cx)
     }
@@ -563,6 +666,7 @@ impl Panel {
         state.callback_waiting = false;
         state.flow = None;
         state.prompt = None;
+        state.key_provider = None;
         state.input.update(cx, |input, cx| input.clear(cx));
         state.error = validation_warning.then(|| "Credentials were saved, but the provider could not be verified. If this session does not switch, choose another model. You do not need to reuse the sign-in code.".into());
         let provider = state.provider.map(|provider| provider.id.to_string());
@@ -675,6 +779,10 @@ impl Panel {
             return;
         };
         if state.busy || state.complete {
+            return;
+        }
+        if state.key_provider.is_some() {
+            self.submit_provider_key(cx);
             return;
         }
         let Some(provider) = state.provider.clone() else {
@@ -882,6 +990,8 @@ impl Panel {
                 );
             }
             body = body.child(self.render_login_steps(state, provider, cx));
+        } else if remote {
+            body = body.child(self.render_providers_section(cx));
         } else if !remote {
             let providers = catalog::filtered_providers(
                 &state.providers,
@@ -898,6 +1008,7 @@ impl Panel {
                         .child("No accounts match your search."),
                 );
             }
+            body = body.child(self.render_providers_section(cx));
             let rows = self.render_account_catalog(&providers, cx);
             body = body.children(rows);
         }
@@ -1007,14 +1118,791 @@ impl Panel {
                         .overflow_y_scroll()
                         .child(body),
                 )
+                .children(self.render_provider_dialogs(cx))
                 .into_any_element(),
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_provider_entries(
+        &mut self,
+        entries: Vec<crate::providers::ProviderEntry>,
+    ) {
+        if let Some(state) = self.login.as_mut() {
+            state.entries = entries;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_select_provider_entry(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .login
+            .as_ref()
+            .and_then(|state| state.entries.iter().find(|entry| entry.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        self.select_provider_entry(&entry, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_open_add_provider(&mut self, cx: &mut Context<Self>) {
+        self.open_add_provider(cx);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_open_provider_key(
+        &mut self,
+        provider: &str,
+        display: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_provider_key(provider, display, cx);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_open_remove_provider(&mut self, provider: String, cx: &mut Context<Self>) {
+        self.open_remove_provider(provider, cx);
     }
 
     fn paste_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = &self.login {
             state.input.update(cx, |input, cx| input.paste(window, cx));
         }
+    }
+
+    // ---- Providers surface -------------------------------------------------
+
+    fn set_add_provider_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(draft) = self
+            .login
+            .as_mut()
+            .and_then(|state| state.add_provider.as_mut())
+        {
+            draft.busy = false;
+            draft.error = Some(message);
+        }
+        cx.notify();
+    }
+
+    fn open_add_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.login.as_mut() else {
+            return;
+        };
+        let field = |cx: &mut Context<Self>, placeholder: &str, id: &str| {
+            cx.new(|cx| LoginInput::new_plain(cx, placeholder).with_element_id(id))
+        };
+        state.add_provider = Some(AddProviderState {
+            name: field(cx, "Provider name, e.g. my-gateway", "provider-add-name"),
+            base_url: field(cx, "https://llm.example.com/v1", "provider-add-base"),
+            model: field(cx, "Default model id", "provider-add-model"),
+            context_window: field(cx, "Context window (optional)", "provider-add-context"),
+            api_key_env: field(cx, "API key env var (optional)", "provider-add-env"),
+            api_key: cx.new(|cx| {
+                LoginInput::new(cx, "Paste your API key").with_element_id("provider-add-key")
+            }),
+            no_api_key: false,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn add_provider_spec(&self, cx: &App) -> Result<jcode_sdk::ProviderProfileSpec, String> {
+        let Some(state) = self.login.as_ref() else {
+            return Err("The provider form is not open.".into());
+        };
+        let Some(draft) = state.add_provider.as_ref() else {
+            return Err("The provider form is not open.".into());
+        };
+        let text = |input: &Entity<LoginInput>| input.read(cx).text().trim().to_string();
+        let context_window = match text(&draft.context_window).as_str() {
+            "" => None,
+            raw => Some(
+                raw.parse::<usize>()
+                    .map_err(|_| "Context window must be a whole number of tokens.")?,
+            ),
+        };
+        let api_key_env = text(&draft.api_key_env);
+        let api_key = text(&draft.api_key);
+        let spec = jcode_sdk::ProviderProfileSpec {
+            name: text(&draft.name),
+            base_url: text(&draft.base_url),
+            model: text(&draft.model),
+            context_window,
+            api_key_env: (!api_key_env.is_empty()).then_some(api_key_env),
+            api_key: (!api_key.is_empty()).then_some(api_key),
+            env_file: None,
+            no_api_key: draft.no_api_key,
+            auth: None,
+            auth_header: None,
+            set_default: false,
+            overwrite: false,
+            provider_routing: false,
+            model_catalog: false,
+        };
+        crate::providers::validate_profile_spec(&spec)
+    }
+
+    fn submit_add_provider(&mut self, cx: &mut Context<Self>) {
+        let spec = match self.add_provider_spec(cx) {
+            Ok(spec) => spec,
+            Err(message) => {
+                self.set_add_provider_error(message, cx);
+                return;
+            }
+        };
+        let offline = self.preview_state.is_some()
+            || cfg!(test)
+            || crate::harness::screenshot_mode();
+        if offline {
+            if let Some(state) = self.login.as_mut() {
+                state.add_provider = None;
+            }
+            self.refresh_login_status(cx);
+            return;
+        }
+        if let Some(draft) = self
+            .login
+            .as_mut()
+            .and_then(|state| state.add_provider.as_mut())
+        {
+            draft.busy = true;
+            draft.error = None;
+        }
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::providers::add_provider_profile(spec) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |panel, cx| match result {
+                Ok(()) => {
+                    if let Some(state) = panel.login.as_mut() {
+                        state.add_provider = None;
+                    }
+                    panel.refresh_login_status(cx);
+                }
+                Err(error) => {
+                    panel.set_add_provider_error(error.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_provider_key(&mut self, provider: &str, display_name: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.login.as_mut() else {
+            return;
+        };
+        state.provider = None;
+        state.prompt = None;
+        state.complete = false;
+        state.busy = false;
+        state.error = None;
+        state.key_provider = Some(ProviderKeyState {
+            provider: provider.to_string(),
+            display_name: display_name.to_string(),
+            busy: false,
+            error: None,
+        });
+        state.input = cx.new(|cx| LoginInput::new(cx, "Paste your API key"));
+        state.focus_pending = true;
+        cx.notify();
+    }
+
+    fn submit_provider_key(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.login.as_mut() else {
+            return;
+        };
+        let Some((provider, display)) = state
+            .key_provider
+            .as_ref()
+            .map(|key| (key.provider.clone(), key.display_name.clone()))
+        else {
+            return;
+        };
+        let secret = state.input.update(cx, |input, cx| input.take(cx));
+        if secret.trim().is_empty() {
+            state.error = Some(format!("Paste the API key for {display}."));
+            cx.notify();
+            return;
+        }
+        let offline = self.preview_state.is_some()
+            || cfg!(test)
+            || crate::harness::screenshot_mode();
+        if offline {
+            if let Some(state) = self.login.as_mut() {
+                state.key_provider = None;
+            }
+            self.refresh_login_status(cx);
+            return;
+        }
+        self.run_login_task(
+            move || {
+                crate::providers::set_provider_api_key(&provider, &secret).map_err(|error| {
+                    format!("Could not save the API key for {display}: {error}")
+                })?;
+                Ok(LoginUpdate::Complete {
+                    validation_warning: false,
+                })
+            },
+            cx,
+        );
+    }
+
+    fn open_remove_provider(&mut self, provider: String, cx: &mut Context<Self>) {
+        if let Some(state) = self.login.as_mut() {
+            state.remove_provider = Some(provider);
+        }
+        cx.notify();
+    }
+
+    fn submit_remove_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .login
+            .as_mut()
+            .and_then(|state| state.remove_provider.take())
+        else {
+            return;
+        };
+        let offline = self.preview_state.is_some()
+            || cfg!(test)
+            || crate::harness::screenshot_mode();
+        if offline {
+            self.refresh_login_status(cx);
+            return;
+        }
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::providers::remove_provider_profile(&name) });
+        cx.spawn(async move |this, cx| {
+            let _ = task.await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.refresh_login_status(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn provider_pill(
+        &self,
+        id: String,
+        label: &'static str,
+        color: gpui::Rgba,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::global();
+        let selector = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .flex_none()
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .bg(color.opacity(0.16))
+            .text_size(px(11.0))
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|el| el.bg(color.opacity(0.28)))
+            .child(label)
+            .when(color == theme.ACCENT, |el| el)
+    }
+
+    fn render_provider_admin_row(
+        &self,
+        entry: &crate::providers::ProviderEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::providers::ProviderAction;
+        let theme = Theme::global();
+        let ink = if entry.available() {
+            theme.TEXT
+        } else {
+            theme.TEXT_DIM
+        };
+        let models = entry.available_model_count();
+        let model_text = match models {
+            0 => "No usable model".to_string(),
+            1 => "1 model".to_string(),
+            count => format!("{count} models"),
+        };
+        let logo: gpui::AnyElement = match crate::accounts::logo(&entry.id) {
+            Some(bytes) => gpui::svg()
+                .data(bytes)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(ink)
+                .into_any_element(),
+            None => div()
+                .size(px(16.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(theme.INLINE_CODE_BG)
+                .text_size(px(10.0))
+                .text_color(ink)
+                .child(crate::accounts::lettermark(&entry.display_name))
+                .into_any_element(),
+        };
+        let mut actions = div().flex_none().flex().items_center().gap_1p5();
+        if entry.offers(ProviderAction::Use) {
+            let target = entry.clone();
+            actions = actions.child(self.provider_pill(
+                format!("provider-use-{}", entry.id),
+                "Use",
+                theme.ACCENT,
+            ).on_click(cx.listener(move |this, _, window, cx| {
+                this.select_provider_entry(&target, window, cx);
+            })));
+        }
+        if entry.offers(ProviderAction::SetApiKey) {
+            let provider = entry.id.clone();
+            let name = entry.display_name.clone();
+            actions = actions.child(self.provider_pill(
+                format!("provider-key-{}", entry.id),
+                "Set key",
+                theme.ACCENT,
+            ).on_click(cx.listener(move |this, _, _, cx| {
+                this.open_provider_key(&provider, &name, cx);
+            })));
+        }
+        if entry.offers(ProviderAction::SignIn) {
+            let provider = self
+                .login
+                .as_ref()
+                .and_then(|state| state.providers.iter().find(|p| p.id == entry.id).copied());
+            if let Some(provider) = provider {
+                actions = actions.child(self.provider_pill(
+                    format!("provider-signin-{}", entry.id),
+                    "Sign in",
+                    theme.ACCENT,
+                ).on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_login_provider_for(provider, None, cx);
+                })));
+            }
+        }
+        if entry.offers(ProviderAction::Test) {
+            let id = entry.id.clone();
+            actions = actions.child(self.provider_pill(
+                format!("provider-test-{}", entry.id),
+                "Test",
+                theme.TEXT_DIM,
+            ).on_click(cx.listener(move |this, _, _, cx| {
+                this.live_test_providers(Some(id.clone()), cx);
+            })));
+        }
+        if entry.offers(ProviderAction::Remove) {
+            let id = entry.id.clone();
+            actions = actions.child(self.provider_pill(
+                format!("provider-remove-{}", entry.id),
+                "Remove",
+                theme.ERROR,
+            ).on_click(cx.listener(move |this, _, _, cx| {
+                this.open_remove_provider(id.clone(), cx);
+            })));
+        }
+        let selector = format!("provider-row-{}", entry.id);
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector({
+                let selector = selector.clone();
+                move || selector
+            })
+            .mx_2()
+            .px_3()
+            .py_2()
+            .rounded_full()
+            .bg(theme.HEADER_BG)
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(logo)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(16.0))
+                            .line_height(px(16.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .text_color(ink)
+                                    .child(entry.display_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.TEXT_DIM)
+                                    .child(entry.auth_kind.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(13.0))
+                            .text_color(theme.TEXT_DIM)
+                            .child(format!("{} · {model_text}", entry.status_label())),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn render_providers_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::global();
+        let Some(state) = self.login.as_ref() else {
+            return div().into_any_element();
+        };
+        let remote = self.login_is_remote();
+        let query = state.search.read(cx).content.to_lowercase();
+        let entries: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|entry| {
+                format!(
+                    "{} {} {} {}",
+                    entry.display_name, entry.id, entry.auth_kind, entry.method
+                )
+                .to_lowercase()
+                .contains(query.trim())
+            })
+            .cloned()
+            .collect();
+        let can_admin = !remote && crate::providers::provider_admin_supported();
+        let mut section = div()
+            .id("providers-section")
+            .debug_selector(|| "providers-section".into())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .pt_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .pb_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Providers"),
+                    )
+                    .when(can_admin, |el| {
+                        el.child(
+                            div()
+                                .id("providers-add")
+                                .debug_selector(|| "providers-add".into())
+                                .flex_none()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(theme.ACCENT.opacity(0.16))
+                                .text_size(px(11.0))
+                                .text_color(theme.ACCENT)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme.ACCENT.opacity(0.28)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_add_provider(cx);
+                                }))
+                                .child("Add provider"),
+                        )
+                    }),
+            );
+        if remote {
+            section = section.child(
+                div()
+                    .debug_selector(|| "providers-remote-guidance".into())
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(11.0))
+                    .text_color(theme.TEXT_DIM)
+                    .child("Providers for this remote runtime are managed on its host. This list is read-only."),
+            );
+        }
+        if entries.is_empty() {
+            section = section.child(
+                div()
+                    .debug_selector(|| "providers-empty".into())
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(11.0))
+                    .text_color(theme.TEXT_DIM)
+                    .child(if query.trim().is_empty() {
+                        "No providers reported by the runtime yet."
+                    } else {
+                        "No providers match your search."
+                    }),
+            );
+        }
+        for entry in &entries {
+            section = section.child(self.render_provider_admin_row(entry, cx));
+        }
+        section.child(div().h(px(6.0))).into_any_element()
+    }
+
+    fn provider_dialog_frame(&self, id: &'static str, child: gpui::AnyElement) -> gpui::AnyElement {
+        let theme = Theme::global();
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.BG.opacity(0.66))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(440.0))
+                    .p_4()
+                    .rounded_xl()
+                    .bg(theme.PANEL_BG)
+                    .border_1()
+                    .border_color(theme.PANEL_BORDER)
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(child),
+            )
+            .into_any_element()
+    }
+
+    fn render_provider_dialogs(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = Theme::global();
+        let mut dialogs = Vec::new();
+        if let Some(draft) = self.login.as_ref().and_then(|state| state.add_provider.as_ref()) {
+            let field = |label: &'static str, input: &Entity<LoginInput>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.TEXT_DIM)
+                            .child(label),
+                    )
+                    .child(input.clone())
+            };
+            let mut body = div().flex().flex_col().gap_2().child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Add OpenAI-compatible provider"),
+            );
+            body = body
+                .child(field("Name", &draft.name))
+                .child(field("Base URL", &draft.base_url))
+                .child(field("Default model", &draft.model))
+                .child(field("Context window", &draft.context_window))
+                .child(field("API key env var", &draft.api_key_env))
+                .child(field("API key", &draft.api_key));
+            if draft.no_api_key {
+                body = body.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.TEXT_DIM)
+                        .child("Stored without a key. Add one later if the endpoint needs it."),
+                );
+            }
+            if let Some(error) = &draft.error {
+                body = body.child(div().text_size(px(11.0)).text_color(theme.ERROR).child(error.clone()));
+            }
+            let busy = draft.busy;
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        div()
+                            .id("provider-add-save")
+                            .debug_selector(|| "provider-add-save".into())
+                            .px_4()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(theme.ACCENT_DIM)
+                            .text_color(theme.TEXT)
+                            .text_size(px(12.0))
+                            .cursor_pointer()
+                            .when(busy, |el| el.opacity(0.6))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_add_provider(cx);
+                            }))
+                            .child(if busy { "Saving…" } else { "Save provider" }),
+                    )
+                    .child(
+                        div()
+                            .id("provider-add-cancel")
+                            .debug_selector(|| "provider-add-cancel".into())
+                            .px_4()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(theme.PANEL_BORDER)
+                            .text_color(theme.TEXT)
+                            .text_size(px(12.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.login.as_mut() {
+                                    state.add_provider = None;
+                                }
+                                cx.notify();
+                            }))
+                            .child("Cancel"),
+                    ),
+            );
+            dialogs.push(self.provider_dialog_frame("provider-add-dialog", body.into_any_element()));
+        }
+
+        if let Some(key) = self.login.as_ref().and_then(|state| state.key_provider.as_ref()) {
+            let mut body = div().flex().flex_col().gap_2().child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Set API key for {}", key.display_name)),
+            );
+            if let Some(state) = self.login.as_ref() {
+                body = body.child(state.input.clone());
+            }
+            if let Some(error) = &key.error {
+                body = body
+                    .child(div().text_size(px(11.0)).text_color(theme.ERROR).child(error.clone()));
+            }
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        div()
+                            .id("provider-key-save")
+                            .debug_selector(|| "provider-key-save".into())
+                            .px_4()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(theme.ACCENT_DIM)
+                            .text_color(theme.TEXT)
+                            .text_size(px(12.0))
+                            .cursor_pointer()
+                            .when(key.busy, |el| el.opacity(0.6))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_provider_key(cx);
+                            }))
+                            .child(if key.busy { "Saving…" } else { "Save key" }),
+                    )
+                    .child(
+                        div()
+                            .id("provider-key-cancel")
+                            .debug_selector(|| "provider-key-cancel".into())
+                            .px_4()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(theme.PANEL_BORDER)
+                            .text_color(theme.TEXT)
+                            .text_size(px(12.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.login.as_mut() {
+                                    state.key_provider = None;
+                                    state.input = cx.new(|cx| LoginInput::new(cx, "Paste the code or callback URL"));
+                                }
+                                cx.notify();
+                            }))
+                            .child("Cancel"),
+                    ),
+            );
+            dialogs.push(self.provider_dialog_frame("provider-key-dialog", body.into_any_element()));
+        }
+
+        if let Some(name) = self.login.as_ref().and_then(|state| state.remove_provider.as_ref()) {
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Remove provider '{name}'?")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.TEXT_DIM)
+                        .child("This deletes the profile and its stored API key. Sessions already using another provider are unaffected."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            div()
+                                .id("provider-remove-confirm")
+                                .debug_selector(|| "provider-remove-confirm".into())
+                                .px_4()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme.ERROR.opacity(0.2))
+                                .text_color(theme.ERROR)
+                                .text_size(px(12.0))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_remove_provider(cx);
+                                }))
+                                .child("Remove"),
+                        )
+                        .child(
+                            div()
+                                .id("provider-remove-cancel")
+                                .debug_selector(|| "provider-remove-cancel".into())
+                                .px_4()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme.PANEL_BORDER)
+                                .text_color(theme.TEXT)
+                                .text_size(px(12.0))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(state) = this.login.as_mut() {
+                                        state.remove_provider = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("Cancel"),
+                        ),
+                );
+            dialogs.push(self.provider_dialog_frame("provider-remove-dialog", body.into_any_element()));
+        }
+        dialogs
     }
 }
 

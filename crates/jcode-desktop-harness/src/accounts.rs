@@ -18,6 +18,11 @@ pub fn request_refresh() {
     }
 }
 
+/// Monotonic count of requested refreshes, for tests and diagnostics.
+pub fn refresh_generation() -> u64 {
+    AUTH_REFRESH.0.lock().map(|generation| *generation).unwrap_or(0)
+}
+
 /// One supported provider, as reported by the CLI's canonical auth report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Account {

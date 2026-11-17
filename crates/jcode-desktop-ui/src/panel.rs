@@ -471,6 +471,9 @@ pub struct Panel {
     pub model: Option<String>,
     /// Provider display name, e.g. `openai` or `anthropic`.
     pub provider: Option<String>,
+    /// Model routes from the last runtime identity event, for provider
+    /// inventory and switch targets.
+    pub routes: Vec<jcode_sdk::ModelRouteInfo>,
     /// Credential route for the current model, e.g. `oauth` or `api key`.
     pub auth_method: Option<String>,
     pub account_label: Option<String>,
@@ -950,6 +953,7 @@ impl Panel {
             connection_phase: String::new(),
             model: usage_fixture.then(|| "gpt-5.6-sol".into()),
             provider: usage_fixture.then(|| "openai".into()),
+            routes: Vec::new(),
             auth_method: usage_fixture.then(|| "oauth".into()),
             account_label: usage_fixture.then(|| "work@example.com".into()),
             reasoning_effort: usage_fixture.then(|| "high".into()),
@@ -3044,6 +3048,10 @@ impl Panel {
                     .as_deref()
                     .map(human_auth_method)
                     .or_else(|| auth_method_for_model(self.model.as_deref(), routes));
+                self.routes = routes.to_vec();
+                if self.login.is_some() {
+                    self.rebuild_provider_entries(cx);
+                }
                 let models = available_model_names(routes);
                 self.available_models = models.clone();
                 self.input.update(cx, |input, cx| {
