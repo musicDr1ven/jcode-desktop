@@ -205,6 +205,28 @@ impl Panel {
     }
 
     pub(crate) fn connection_lost(&mut self, reason: &str, cx: &mut Context<Self>) {
+        // A restored panel can point at a session that was never saved or was
+        // removed. It will never come back, so show a settled notice instead of
+        // a permanent "Reconnecting…" status.
+        if reason.contains("session unavailable")
+            || reason.contains("Unknown session")
+            || reason.contains("could not be loaded for attachment")
+        {
+            self.pending_users.clear();
+            self.finish_response();
+            self.status = "idle".into();
+            self.connection_phase.clear();
+            let notice = "This session is no longer available. Open a new session in the same folder to continue.";
+            let already = matches!(
+                self.items.last(),
+                Some(Item::Error(text)) if text.as_str() == notice
+            );
+            if !already {
+                self.items.push(Item::Error(notice.into()));
+            }
+            cx.notify();
+            return;
+        }
         if self.activity_active() || !self.pending_users.is_empty() {
             self.record_stop(StopNotice {
                 title: "Connection lost. Reconnecting…".into(),

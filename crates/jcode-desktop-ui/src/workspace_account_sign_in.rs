@@ -52,7 +52,6 @@ pub(super) struct State {
 struct Demo {
     panel: Entity<Panel>,
     _replay: gpui::Task<()>,
-    _load: Option<gpui::Task<()>>,
 }
 
 /// Keyboard stops, in the left column's reading order.
@@ -417,10 +416,11 @@ impl Workspace {
         }
     }
 
-    /// Start the live chat replay on the right half, once per visible page.
-    /// The user's own longest sessions across every harness (Jcode, Claude
-    /// Code, Codex, Cursor and Pi) replace the built-in demo when they exist
-    /// and replay in turn. They are only read, never imported or sent.
+    /// Start the canned chat replay on the right half, once per visible page.
+    ///
+    /// Never replay the user's own sessions here. Doing that made a first-run
+    /// demo of a real transcript look like Desktop had resumed and continued an
+    /// old conversation. The fixed sample makes it clearly a demonstration.
     fn ensure_account_demo(&mut self, cx: &mut Context<Self>) {
         if self.account_sign_in.demo.is_some() {
             return;
@@ -431,33 +431,9 @@ impl Workspace {
             crate::panel::demo_replay::builtin_script(),
             cx,
         );
-        let load = live().then(|| {
-            let samples = cx.background_executor().spawn(async {
-                jcode_base::transcript_sample::recent_external_transcripts(SHOWCASE_TRANSCRIPTS)
-            });
-            cx.spawn(async move |this, cx| {
-                let samples = samples.await;
-                if samples.is_empty() {
-                    return;
-                }
-                let _ = this.update(cx, |this, cx| {
-                    let Some(demo) = this.account_sign_in.demo.as_mut() else {
-                        return;
-                    };
-                    let showcase = samples
-                        .into_iter()
-                        .map(|sample| (Some(format!("From {}", sample.source)), sample.turns))
-                        .collect();
-                    demo._replay =
-                        crate::panel::demo_replay::run_showcase(demo.panel.clone(), showcase, cx);
-                    demo._load = None;
-                });
-            })
-        });
         self.account_sign_in.demo = Some(Demo {
             panel,
             _replay: replay,
-            _load: load,
         });
     }
 
@@ -1700,8 +1676,6 @@ impl Workspace {
     }
 }
 
-/// The longest real sessions replayed in turn on the right half.
-const SHOWCASE_TRANSCRIPTS: usize = 4;
 /// Five theme swatches per row, plus the grid's focus outline.
 const LEFT_CONTENT_WIDTH: f32 = 512.0;
 const LEFT_COLUMN_PADDING: f32 = 48.0;

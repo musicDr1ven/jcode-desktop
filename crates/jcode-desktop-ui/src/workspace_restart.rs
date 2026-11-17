@@ -182,6 +182,62 @@ pub(crate) fn take_restore_state(window: &Window, app: &App) -> Option<Workspace
     snapshot
 }
 
+/// Restore the last workspace after a normal close/reopen.
+///
+/// The per-window manifest already tracks folders, panels, drafts, and session
+/// ids for `/restart-all`. A plain launch (no session/resume/mode arguments)
+/// has no other source, so use the newest manifest left by a Desktop process
+/// that is no longer running. One window per process restores; later windows
+/// start fresh. Explicit launches keep their own behavior.
+pub(crate) fn take_last_window(window: &Window, app: &App) -> Option<WorkspaceSnapshot> {
+    if cfg!(test) || crate::harness::screenshot_mode() {
+        return None;
+    }
+    let launch =
+        jcode_desktop_api::WindowLaunches::get(app, window.window_handle().window_id().as_u64());
+    if !launch.args.is_empty() {
+        return None;
+    }
+    static RESTORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RESTORED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    take_last_manifest()
+}
+
+fn take_last_manifest() -> Option<WorkspaceSnapshot> {
+    let dir = manifests_dir()?;
+    let mut best: Option<(u64, PathBuf, Manifest)> = None;
+    for entry in fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(manifest) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if process_alive(manifest.pid) && is_desktop_process(manifest.pid) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(updated, _, _)| manifest.updated_at_ms > *updated)
+        {
+            best = Some((manifest.updated_at_ms, path, manifest));
+        }
+    }
+    let (_, path, manifest) = best?;
+    let bytes = serde_json::to_vec(&manifest.snapshot).ok()?;
+    let snapshot = decode_restore(&bytes)?;
+    // Consume it once so a second window does not replay the same workspace.
+    let _ = fs::remove_file(&path);
+    eprintln!("restoring desktop workspace from {}", path.display());
+    Some(snapshot)
+}
+
 fn decode_restore(bytes: &[u8]) -> Option<WorkspaceSnapshot> {
     let mut snapshot = WorkspaceSnapshot::decode(bytes).ok()?;
     for slot in &mut snapshot.slots {

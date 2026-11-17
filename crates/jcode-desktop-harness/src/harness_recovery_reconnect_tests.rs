@@ -1,5 +1,5 @@
 #[test]
-fn interrupted_remote_session_recovers_again_after_transport_replacement() {
+fn interrupted_remote_session_waits_for_an_explicit_prompt_after_transport_replacement() {
     let ui_id = remote::namespace("desktop", "same-id");
     let (commands, rx) = channel();
     let (tx, updates) = update_channel();
@@ -27,16 +27,24 @@ fn interrupted_remote_session_recovers_again_after_transport_replacement() {
         });
         assert!(matches!(server.next(), ApiRequest::GetHistory { .. }));
         assert!(matches!(server.next(), ApiRequest::GetRuntimeInfo { .. }));
-        assert!(
-            matches!(server.next(), ApiRequest::SendMessage { session_id, content, system_reminder, .. }
-            if session_id == "same-id" && content.is_empty() && system_reminder == Some(format!("continue interrupted attempt {attempt}")))
-        );
-        wait_update(&updates, |update| {
-            matches!(update, Update::Event {
-                session_id,
-                event: ApiEvent::MessageAccepted { session_id: inner },
-            } if session_id == &ui_id && inner == &ui_id)
-        });
+
+        // Desktop must stay idle after an interruption, both on the first
+        // attachment and after the transport is replaced. Drain a short window
+        // so unrelated bootstrap requests do not hide a continuation send.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match server.requests.try_recv() {
+                Ok(request) => assert!(
+                    !matches!(request, ApiRequest::SendMessage { .. }),
+                    "recovery must not auto-continue after a transport replacement"
+                ),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
         if attempt == 0 {
             // No TurnDone: the old worker activity flag is still true here.
             server.disconnect();

@@ -458,6 +458,14 @@ impl gpui::EventEmitter<AccountsPanelChooseModel> for Panel {}
 
 impl gpui::EventEmitter<AccountsPanelClosed> for Panel {}
 
+/// A skill the runtime reports as loaded for this session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
 pub struct Panel {
     pub preview_state: Option<PreviewState>,
     /// Scripted onboarding replay: real rendering and motion, never sounds.
@@ -474,6 +482,10 @@ pub struct Panel {
     /// Model routes from the last runtime identity event, for provider
     /// inventory and switch targets.
     pub routes: Vec<jcode_sdk::ModelRouteInfo>,
+    /// Skills the runtime reports for this session, used to route `/skillname`
+    /// through the agent the way the CLI does.
+    pub(crate) skills: Vec<SkillEntry>,
+    skills_requested: bool,
     /// Credential route for the current model, e.g. `oauth` or `api key`.
     pub auth_method: Option<String>,
     pub account_label: Option<String>,
@@ -954,6 +966,8 @@ impl Panel {
             model: usage_fixture.then(|| "gpt-5.6-sol".into()),
             provider: usage_fixture.then(|| "openai".into()),
             routes: Vec::new(),
+            skills: Vec::new(),
+            skills_requested: false,
             auth_method: usage_fixture.then(|| "oauth".into()),
             account_label: usage_fixture.then(|| "work@example.com".into()),
             reasoning_effort: usage_fixture.then(|| "high".into()),
@@ -1944,21 +1958,7 @@ impl Panel {
                             } else if this.model_picker_open {
                                 this.close_model_picker(cx);
                                 handled = true;
-                            } else if !this.is_pending_session()
-                                && (this.status != "idle"
-                                    || !this.connection_phase.is_empty()
-                                    || !this.streaming_text.is_empty()
-                                    || !this.streaming_reasoning.is_empty()
-                                    || !this.pending_users.is_empty())
-                            {
-                                if this.preview_state.is_none() {
-                                    this.bridge.send(Command::Cancel {
-                                        session_id: this.session_id.clone(),
-                                    });
-                                }
-                                this.prompt_queue.paused = true;
-                                this.sound_events.cancel();
-                                this.record_stop(stop_reason::StopNotice::cancel_requested());
+                            } else if this.cancel_active_turn(cx) {
                                 handled = true;
                             }
                             cx.notify();
@@ -2280,10 +2280,12 @@ impl Panel {
                     "Make logical commits for the current uncommitted work, preserving unrelated work and validating appropriately. Then push to the tracking branch without force-pushing, and report the commits and push result.",
                     cx,
                 ),
-                _ if trimmed.starts_with('/') => self.items.push(Item::Error(format!(
-                    "{}",
-                    command_unavailable_message(trimmed)
-                ))),
+                _ if trimmed.starts_with('/') => {
+                    if !self.invoke_skill_command(trimmed, cx) {
+                        self.items
+                            .push(Item::Error(command_unavailable_message(trimmed)));
+                    }
+                }
                 _ => return false,
             }
         }
@@ -2291,6 +2293,48 @@ impl Panel {
         self.transcript_list.scroll_to_end();
         cx.notify();
         true
+    }
+
+    /// Route `/skill-name [prompt]` to the agent when the runtime reports that
+    /// skill as loaded. The CLI expands skills client-side; Desktop asks the
+    /// agent to use its `skill` tool so installed skills work here too.
+    fn invoke_skill_command(&mut self, input: &str, cx: &mut Context<Self>) -> bool {
+        let Some((name, trailing)) = self.skill_invocation(input) else {
+            return false;
+        };
+        let content = if trailing.is_empty() {
+            format!("Load and follow the `{name}` skill.")
+        } else {
+            format!("Load and follow the `{name}` skill. {trailing}")
+        };
+        self.items
+            .push(Item::Assistant(format!("Activated skill: {name}")));
+        self.submit_or_queue(content, Vec::new(), false, cx);
+        self.stick_to_bottom = true;
+        self.transcript_list.scroll_to_end();
+        cx.notify();
+        true
+    }
+
+    /// Longest loaded skill name matching a leading `/`, plus trailing prompt.
+    fn skill_invocation(&self, input: &str) -> Option<(String, String)> {
+        let rest = input.trim().strip_prefix('/')?;
+        let mut best: Option<(String, String)> = None;
+        for skill in &self.skills {
+            let Some(after) = rest.strip_prefix(skill.name.as_str()) else {
+                continue;
+            };
+            if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(name, _)| skill.name.len() > name.len())
+            {
+                best = Some((skill.name.clone(), after.trim().to_string()));
+            }
+        }
+        best
     }
 
     /// Compose cards a later Gmail call replaced, recomputed only when the
@@ -2827,6 +2871,39 @@ impl Panel {
                     data: data.clone(),
                     message: message.clone(),
                 };
+                if matches!(*command, jcode_sdk::api::RuntimeCommand::Skills) {
+                    self.skills = data
+                        .get("skills")
+                        .and_then(|value| value.as_array())
+                        .map(|skills| {
+                            skills
+                                .iter()
+                                .filter_map(|skill| {
+                                    Some(SkillEntry {
+                                        name: skill.get("name")?.as_str()?.to_string(),
+                                        description: skill
+                                            .get("description")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        path: skill
+                                            .get("path")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let commands: Vec<(String, String)> = self
+                        .skills
+                        .iter()
+                        .map(|skill| (format!("/{}", skill.name), skill.description.clone()))
+                        .collect();
+                    self.input
+                        .update(cx, |input, cx| input.set_skill_commands(commands, cx));
+                }
                 self.items.push(Item::Assistant(output.message.clone()));
                 self.apply_special_command_artifacts(&output, cx);
                 self.stick_to_bottom = true;
@@ -3049,6 +3126,22 @@ impl Panel {
                     .map(human_auth_method)
                     .or_else(|| auth_method_for_model(self.model.as_deref(), routes));
                 self.routes = routes.to_vec();
+                if !cfg!(test)
+                    && self.skills.is_empty()
+                    && !self.skills_requested
+                    && !self.demo
+                    && self.preview_state.is_none()
+                    && !self.is_pending_session()
+                    && crate::harness::remote_host(&self.session_id).is_none()
+                    && !self.session_id.starts_with("startup://")
+                {
+                    self.skills_requested = true;
+                    self.bridge.send(Command::RuntimeCommand {
+                        session_id: self.session_id.clone(),
+                        command: jcode_sdk::api::RuntimeCommand::Skills,
+                        args: Vec::new(),
+                    });
+                }
                 if self.login.is_some() {
                     self.rebuild_provider_entries(cx);
                 }
@@ -3366,6 +3459,35 @@ impl Panel {
                     | "running_tools"
                     | "compacting"
             )
+    }
+
+    /// Whether the panel has a turn that can be stopped right now.
+    pub(super) fn can_stop_turn(&self) -> bool {
+        // The onboarding demo replays scripted turns through the real reducer,
+        // so it looks busy but has no runtime behind it. Never offer a Stop
+        // control that cannot do anything.
+        !self.demo
+            && !self.is_pending_session()
+            && (self.activity_active() || !self.pending_users.is_empty())
+    }
+
+    /// Stop the active turn and pause the queue. Escape, `/cancel`, and the
+    /// Stop button all take this path so the transcript notice and queue
+    /// behavior stay identical.
+    pub(super) fn cancel_active_turn(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.can_stop_turn() {
+            return false;
+        }
+        if self.preview_state.is_none() {
+            self.bridge.send(Command::Cancel {
+                session_id: self.session_id.clone(),
+            });
+        }
+        // `record_stop` pauses the queue, cancels the sound, clears unacked
+        // prompts, and settles activity, so Escape and the button agree.
+        self.record_stop(stop_reason::StopNotice::cancel_requested());
+        cx.notify();
+        true
     }
 
     fn render_transcript_activity(&self) -> gpui::AnyElement {
@@ -9240,6 +9362,73 @@ mod tests {
         assert!(matches!(
             commands.recv_timeout(std::time::Duration::from_millis(100)),
             Ok(Command::Cancel { session_id }) if session_id == "session-a"
+        ));
+    }
+
+    #[gpui::test]
+    fn stop_button_visible_during_a_turn_cancels_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::input::bind_keys(cx));
+        let (bridge, commands) = crate::harness::spawn_recording();
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                crate::workspace::Workspace::for_test(crate::learning::Coach::new(), cx);
+            workspace.set_test_bridge(bridge);
+            workspace.push_test_panel("session-a", cx);
+            workspace
+        });
+        let mut panel = None;
+        workspace.update(vcx, |workspace, _| panel = workspace.test_panel(0));
+        let panel = panel.expect("test panel exists");
+        panel.update(vcx, |panel, cx| {
+            panel.status = "busy".into();
+            cx.notify();
+        });
+
+        vcx.run_until_parked();
+        let stop = vcx
+            .debug_bounds("panel-stop")
+            .expect("Stop button is visible while a turn is active");
+        vcx.simulate_click(stop.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        assert!(vcx.debug_bounds("panel-stop").is_none());
+        panel.read_with(vcx, |panel, _| assert!(!panel.can_stop_turn()));
+        assert!(matches!(
+            commands.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(Command::Cancel { session_id }) if session_id == "session-a"
+        ));
+    }
+
+    #[gpui::test]
+    fn skill_slash_command_routes_to_the_agent(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::input::bind_keys(cx));
+        let (bridge, commands) = crate::harness::spawn_recording();
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                crate::workspace::Workspace::for_test(crate::learning::Coach::new(), cx);
+            workspace.set_test_bridge(bridge);
+            workspace.push_test_panel("session-a", cx);
+            workspace
+        });
+        let mut panel = None;
+        workspace.update(vcx, |workspace, _| panel = workspace.test_panel(0));
+        let panel = panel.expect("test panel exists");
+        let routed = panel.update(vcx, |panel, cx| {
+            panel.skills = vec![SkillEntry {
+                name: "openspec-propose".into(),
+                description: "Propose a change".into(),
+                path: "/tmp/openspec-propose/SKILL.md".into(),
+            }];
+            panel.handle_slash_command_for_test("/openspec-propose add a change", cx)
+        });
+        assert!(routed);
+        vcx.run_until_parked();
+        assert!(matches!(
+            commands.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(Command::Send { session_id, content, .. })
+                if session_id == "session-a"
+                    && content.contains("openspec-propose")
+                    && content.contains("add a change")
         ));
     }
 

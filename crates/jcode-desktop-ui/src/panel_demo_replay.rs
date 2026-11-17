@@ -318,4 +318,27 @@ mod tests {
         });
         drop(task);
     }
+
+    #[gpui::test]
+    fn demo_replay_never_offers_a_stop_control(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = cx.add_window_view(|_, cx| Panel::new_demo("Demo", cx));
+        panel.update(vcx, |panel, cx| {
+            panel.demo_event(
+                ApiEvent::SessionStatus {
+                    session_id: "demo://onboarding".into(),
+                    status: "thinking".into(),
+                    pending_soft_interrupts: None,
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |panel, _| {
+            assert!(panel.demo);
+            assert!(
+                !panel.can_stop_turn(),
+                "a scripted demo has no runtime turn to stop"
+            );
+        });
+    }
 }

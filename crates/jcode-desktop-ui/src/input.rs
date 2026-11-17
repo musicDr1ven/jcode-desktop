@@ -185,6 +185,9 @@ pub struct PromptInput {
     on_change: Option<Box<dyn Fn(&str, &mut App)>>,
     on_overlay_cancel: Option<Box<dyn Fn(&mut App) -> bool>>,
     command_models: Vec<String>,
+    /// Loaded runtime skills as `/name` plus description, merged into the
+    /// slash palette next to the built-in commands.
+    skill_commands: Vec<(String, String)>,
     command_completion: bool,
     command_selection: usize,
     model_details: HashMap<String, model_menu::ModelDetails>,
@@ -548,6 +551,7 @@ impl PromptInput {
             on_change: None,
             on_overlay_cancel: None,
             command_models: Vec::new(),
+            skill_commands: Vec::new(),
             command_completion: true,
             command_selection: 0,
             model_details: HashMap::new(),
@@ -722,6 +726,20 @@ impl PromptInput {
         }
     }
 
+    /// Merge the runtime's loaded skills into the slash palette.
+    pub(crate) fn set_skill_commands(
+        &mut self,
+        commands: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.skill_commands != commands {
+            self.skill_commands = commands;
+            self.suggestions_revision += 1;
+            self.command_selection = 0;
+            cx.notify();
+        }
+    }
+
     pub fn set_model_routes(
         &mut self,
         mut models: Vec<String>,
@@ -874,14 +892,16 @@ impl PromptInput {
                 })
                 .collect()
             } else {
-                command_suggestions_with_efforts(
+                let mut rows = command_suggestions_with_efforts(
                     &self.content,
                     &self.command_models,
                     EffortMenu {
                         ladder: Some(&self.effort_ladder),
                         current: self.current_effort.as_deref(),
                     },
-                )
+                );
+                rows.extend(self.skill_command_suggestions());
+                rows
             };
         suggestions
             .into_iter()
@@ -900,6 +920,32 @@ impl PromptInput {
                     };
                 }
                 suggestion
+            })
+            .collect()
+    }
+
+    /// Loaded runtime skills offered in the same palette as built-in commands.
+    fn skill_command_suggestions(&self) -> Vec<CommandSuggestion> {
+        let trimmed = self.content.trim_start();
+        if !trimmed.starts_with('/') || trimmed.contains('\n') {
+            return Vec::new();
+        }
+        let query = trimmed.to_ascii_lowercase();
+        let needle = query.trim_start_matches('/');
+        self.skill_commands
+            .iter()
+            .filter(|(command, help)| {
+                let command_lower = command.to_ascii_lowercase();
+                command_lower.starts_with(&query)
+                    || command_lower.contains(needle)
+                    || help.to_ascii_lowercase().contains(needle)
+            })
+            .map(|(command, help)| CommandSuggestion {
+                value: command.clone(),
+                help: help.clone(),
+                detail: None,
+                header: None,
+                toggle: None,
             })
             .collect()
     }
@@ -2613,6 +2659,30 @@ mod tests {
                 .iter()
                 .any(|entry| entry.value == "/commit")
         );
+    }
+
+    #[gpui::test]
+    fn slash_palette_includes_loaded_skills(cx: &mut TestAppContext) {
+        let (input, vcx) =
+            cx.add_window_view(|_, cx| PromptInput::new(cx, "Type something…", |_, _, _, _| {}));
+        input.update(vcx, |input, cx| {
+            input.set_content("/opens".into(), cx);
+            input.set_skill_commands(
+                vec![(
+                    "/openspec-propose".into(),
+                    "Propose an OpenSpec change".into(),
+                )],
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        input.read_with(vcx, |input, _| {
+            let rows = input.build_command_suggestions();
+            assert!(
+                rows.iter().any(|row| row.value == "/openspec-propose"),
+                "loaded skills should appear in the slash palette: {rows:?}"
+            );
+        });
     }
 
     #[test]

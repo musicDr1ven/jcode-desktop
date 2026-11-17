@@ -94,9 +94,13 @@ impl Panel {
         // every connected one, not just catalog entries.
         let covered: std::collections::HashSet<&str> =
             rows.iter().map(|row| row.provider.id).collect();
-        let entries: Vec<_> = state
-            .entries
-            .iter()
+        // Read the live inventory instead of the cached set. The cached set
+        // can be built while the session is still starting, before the runtime
+        // route catalog arrives; it then has every provider at zero available
+        // models and the picker hides them all, leaving only account rows.
+        let entries: Vec<_> = self
+            .provider_inventory()
+            .into_iter()
             .filter(|entry| entry.available() && entry.available_model_count() > 0)
             .filter(|entry| !covered.contains(entry.id.as_str()))
             .filter(|entry| {
@@ -107,7 +111,6 @@ impl Panel {
                 .to_lowercase()
                 .contains(query.trim())
             })
-            .cloned()
             .collect();
         let visible = Rc::new(Vec::new());
         let remote = self.login_is_remote();

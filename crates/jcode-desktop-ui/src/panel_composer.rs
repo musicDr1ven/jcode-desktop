@@ -195,6 +195,20 @@ impl Panel {
                     )
                     .children(self.render_context_meter()),
             )
+            // A visible stop affordance while a turn is active. Escape and
+            // `/cancel` do the same thing, but the button is discoverable.
+            .when(self.can_stop_turn(), |el| {
+                el.child(
+                    composer_pill("panel-stop")
+                        .bg(theme.ACCENT_DIM)
+                        .text_color(theme.ACCENT)
+                        .child("Stop")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_active_turn(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "composer-trailing".into())

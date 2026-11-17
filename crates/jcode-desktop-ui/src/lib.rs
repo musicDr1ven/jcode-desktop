@@ -283,13 +283,14 @@ unsafe extern "C-unwind" fn activate(
     unsafe { host.install_element_arena_context() };
     init_harness();
     let snapshot = if snapshot_len == 0 {
-        // A `/restart-all` relaunch names its own saved window state.
-        let restart = {
-            let window = unsafe { &*window.cast::<Window>() };
-            let app = unsafe { &*app.cast::<App>() };
-            workspace::restart::take_restore_state(window, app)
-        };
-        restart.or_else(workspace::recovery::load)
+        // A `/restart-all` relaunch names its own saved window state. Otherwise
+        // a recent crash wins, then the last clean window manifest, so a normal
+        // close/reopen keeps folders, panels, and the last session.
+        let window = unsafe { &*window.cast::<Window>() };
+        let app = unsafe { &*app.cast::<App>() };
+        workspace::restart::take_restore_state(window, app)
+            .or_else(workspace::recovery::load)
+            .or_else(|| workspace::restart::take_last_window(window, app))
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(snapshot, snapshot_len) };
         match workspace::WorkspaceSnapshot::decode(bytes) {

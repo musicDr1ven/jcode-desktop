@@ -69,8 +69,6 @@ mod transport {
 mod disconnect;
 #[path = "harness_history.rs"]
 mod history;
-#[path = "harness_recovery.rs"]
-mod recovery;
 
 /// Decode the host carried by a persisted remote panel ID.
 pub fn remote_host(session_id: &str) -> Option<String> {
@@ -620,6 +618,18 @@ pub fn spawn_recording() -> (Bridge, Receiver<Command>) {
 }
 
 fn connect(client_name: &str) -> jcode_sdk::Result<JcodeClient> {
+    connect_with_start(client_name, false)
+}
+
+/// Connect for session creation. Unlike a panel reconnect, creating the
+/// startup draft may bring up a missing daemon as well as a missing bridge:
+/// otherwise a launch with no runtime leaves the draft retrying a dead socket
+/// forever.
+fn connect_for_create(client_name: &str) -> jcode_sdk::Result<JcodeClient> {
+    connect_with_start(client_name, true)
+}
+
+fn connect_with_start(client_name: &str, start_daemon: bool) -> jcode_sdk::Result<JcodeClient> {
     let attempt = || {
         JcodeClient::connect(ConnectOptions {
             client_name: format!("jcode-desktop-{client_name}/{}", crate::client_version()),
@@ -631,14 +641,13 @@ fn connect(client_name: &str) -> jcode_sdk::Result<JcodeClient> {
     };
     match attempt() {
         Err(error) if error.kind == jcode_sdk::ErrorKind::ConnectFailed => {
-            // The runtime was started once at bridge startup. If the harness
-            // API bridge later dies (a self-dev restart interrupted halfway,
-            // a crash), its socket file is left behind with nothing listening
-            // and every panel retried the dead socket forever. Respawn the
-            // runtime here instead. The bridge holds a single-instance lock,
-            // so concurrent respawns from several panels are harmless, and the
+            // The runtime may have never started, or its bridge may have died
+            // and left a socket with nothing listening. Bring up whatever is
+            // missing instead of retrying the dead socket forever. A bridge
+            // holds a single-instance lock and RUNTIME_START serializes local
+            // starts in this process, so concurrent callers are harmless; the
             // throttle keeps a genuinely broken install from fork-looping.
-            if !revive_local_runtime() {
+            if !revive_local_runtime(start_daemon) {
                 return Err(error);
             }
             attempt()
@@ -650,14 +659,16 @@ fn connect(client_name: &str) -> jcode_sdk::Result<JcodeClient> {
 /// Minimum spacing between runtime respawn attempts from reconnect paths.
 const RUNTIME_REVIVE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Respawn the harness API bridge when the daemon is up but the bridge is not.
+/// Respawn the harness API bridge (and, when allowed, the daemon).
 /// Returns whether a revive was attempted and succeeded.
 ///
-/// A missing daemon is left alone on purpose: a self-dev reload takes the
-/// daemon socket away for a moment, and spawning a competing `jcode serve`
-/// from every reconnecting panel would fight the handoff.
-fn revive_local_runtime() -> bool {
-    if !jcode_sdk::socket_accepts(&jcode_sdk::api::legacy_socket_path()) {
+/// Panel reconnects leave a temporarily missing daemon alone: a self-dev reload
+/// takes the daemon socket away for a moment, and spawning a competing
+/// `jcode serve` from every reconnecting panel would fight the handoff. The
+/// create path passes `start_daemon = true` so a launch with no runtime starts
+/// one instead of looping on a dead socket.
+fn revive_local_runtime(start_daemon: bool) -> bool {
+    if !start_daemon && !jcode_sdk::socket_accepts(&jcode_sdk::api::legacy_socket_path()) {
         return false;
     }
     static LAST_ATTEMPT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
@@ -814,9 +825,16 @@ fn run_with_transports(
                 std::thread::Builder::new()
                     .name("jcode-bridge-create".into())
                     .spawn(move || {
+                        // Back off between runtime start attempts. Retrying a
+                        // dead socket every 500ms burns CPU while a slow or
+                        // broken daemon comes up; the startup draft still
+                        // recovers once the runtime is ready.
+                        let mut retry_delay = Duration::from_millis(250);
                         loop {
-                            let result =
-                                spawn_profile::create(|| connect("create"), working_dir.clone());
+                            let result = spawn_profile::create(
+                                || connect_for_create("create"),
+                                working_dir.clone(),
+                            );
                             match result {
                                 Ok((session, client)) => {
                                     let _ = internal.send(Command::CreatedInternal {
@@ -846,7 +864,9 @@ fn run_with_transports(
                                     }
                                     // Keep the startup draft usable across a daemon
                                     // restart without requiring a desktop restart.
-                                    std::thread::sleep(Duration::from_millis(500));
+                                    std::thread::sleep(retry_delay);
+                                    retry_delay =
+                                        (retry_delay * 2).min(Duration::from_secs(5));
                                 }
                             }
                         }
@@ -2048,6 +2068,16 @@ fn session_worker_with_connector(
             if disconnect::report_protocol_failure(&error, &session_id, &updates) {
                 return;
             }
+            // A restored panel can name a session that was never saved or was
+            // removed. Retrying cannot bring it back, so surface it once and
+            // stop the worker instead of looping forever.
+            if matches!(
+                error.kind,
+                jcode_sdk::ErrorKind::Harness(jcode_sdk::api::ErrorCode::UnknownSession)
+            ) {
+                lost(format!("{error}; session unavailable"));
+                return;
+            }
             if should_log_reconnect(failed_attempts) {
                 lost(format!("{error}; reconnecting"));
             }
@@ -2074,7 +2104,6 @@ fn session_worker_with_connector(
         // Activity from the dead transport must not suppress recovery on its
         // replacement. The new attachment supplies its own live state.
         let mut turn_active = false;
-        let mut recovery = recovery::Recovery::default();
         // Acceptance and rejection belong to this transport. A lost ack on
         // the previous connection must not block server-directed recovery.
         // Explicit attachment-mismatch retries already live in `pending`.
@@ -2163,7 +2192,6 @@ fn session_worker_with_connector(
                         }
                     }
                     SessionCommand::Send { content, images } => {
-                        recovery.supersede();
                         // New input starts its own request and retry budget.
                         if turn_retry.user_sent() == jcode_sdk::RetryDecision::Cancelled {
                             send_retry_phase(&updates, &session_id, String::new());
@@ -2229,7 +2257,6 @@ fn session_worker_with_connector(
                         }
                     }
                     SessionCommand::Cancel => {
-                        recovery.supersede();
                         if turn_retry.user_cancelled() == jcode_sdk::RetryDecision::Cancelled {
                             send_retry_phase(&updates, &session_id, String::new());
                         }
@@ -2341,7 +2368,6 @@ fn session_worker_with_connector(
                                 | SessionOperation::Rewind(_)
                                 | SessionOperation::RewindUndo
                         ) {
-                            recovery.supersede();
                             if turn_retry.user_cancelled() == jcode_sdk::RetryDecision::Cancelled {
                                 send_retry_phase(&updates, &session_id, String::new());
                             }
@@ -2433,7 +2459,6 @@ fn session_worker_with_connector(
                 && unaccepted_sends.is_empty()
                 && turn_retry.take_due(std::time::Instant::now())
             {
-                recovery.supersede();
                 match client
                     .send_system_reminder(real_id, jcode_sdk::turn_retry::CONTINUATION_REMINDER)
                 {
@@ -2498,45 +2523,12 @@ fn session_worker_with_connector(
                 if matches!(event, ApiEvent::History { .. }) {
                     history.loaded();
                 }
-                if let ApiEvent::SessionRecovery {
-                    continuation_message,
-                    ..
-                } = &event
-                {
-                    // This is the same server-owned directive used by the TUI,
-                    // not a guess based on a sidebar's cached crash badge.
-                    if recovery.claim(
-                        continuation_message,
-                        turn_active || !unaccepted_sends.is_empty(),
-                    ) {
-                        if let Err(error) =
-                            client.send_system_reminder(real_id, continuation_message)
-                        {
-                            recovery.finish_submission();
-                            let _ = updates.send(Update::CommandFailed {
-                                session_id: session_id.clone(),
-                                reason: format!("Failed to continue interrupted work: {error}"),
-                            });
-                        } else {
-                            turn_active = true;
-                            _detach.set_processing(true);
-                            let _ = updates.send(Update::Event {
-                                session_id: session_id.clone(),
-                                event: ApiEvent::SessionStatus {
-                                    session_id: session_id.clone(),
-                                    status: "running".into(),
-                                    pending_soft_interrupts: None,
-                                },
-                            });
-                        }
-                    }
-                    continue;
-                }
-                if recovery.observe(&event) {
-                    // Another client already continued the session. Never
-                    // steer a second automatic continuation into that turn.
-                    turn_active = true;
-                    _detach.set_processing(true);
+                if matches!(&event, ApiEvent::SessionRecovery { .. }) {
+                    // Desktop never continues restored work automatically. The
+                    // user may have abandoned the session on purpose, so a
+                    // fresh attachment stays idle until they send an explicit
+                    // prompt. The TUI still honors the runtime's continuation
+                    // directive; only Desktop declines it.
                     continue;
                 }
                 if recover_async_busy(&event, &mut unaccepted_sends, &mut pending) {

@@ -226,6 +226,14 @@ impl Panel {
         } else {
             self.refresh_login_status(cx);
         }
+        // A session can still be starting when Accounts opens. Without its
+        // route catalog every provider looks like it has no usable model, so
+        // ask for a refresh instead of showing only the saved account rows.
+        if self.routes.is_empty() && self.preview_state.is_none() && !self.demo {
+            self.bridge.send(Command::RefreshRuntime {
+                session_id: self.session_id.clone(),
+            });
+        }
         // Offline screenshot fixture: an OAuth sign-in waiting for the
         // browser, so the checklist can be reviewed without a network.
         if crate::harness::screenshot_mode()

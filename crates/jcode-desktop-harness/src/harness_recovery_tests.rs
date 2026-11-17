@@ -28,27 +28,24 @@ fn recovery_fence(worker: &Worker) {
 }
 
 #[test]
-fn interrupted_session_continues_once_without_composer_input() {
+fn interrupted_session_stays_idle_until_the_user_prompts() {
     let worker = Worker::new(|_| {
         vec![ApiEvent::MessageAccepted {
             session_id: "s1".into(),
         }]
     });
     worker.event(recovery_event("s1"));
-    assert!(
-        matches!(worker.request(), ApiRequest::SendMessage { session_id, content, images, system_reminder, .. }
-        if session_id == "s1" && content.is_empty() && system_reminder.as_deref() == Some("Continue interrupted work.") && images.is_empty())
-    );
-    worker.wait_for(|update| matches!(update, Update::Event { event: ApiEvent::SessionStatus { status, .. }, .. } if status == "running"));
-    worker.event(ApiEvent::TurnDone {
-        session_id: "s1".into(),
-        pending_soft_interrupts: None,
-    });
-    worker.event(recovery_event("s1"));
     recovery_fence(&worker);
     assert!(
         worker.requests.try_recv().is_err(),
-        "duplicate history must not continue again"
+        "an interrupted restored session must not submit work on its own"
+    );
+
+    // Continuation is always an explicit act by the user.
+    worker.send("please continue", vec![]);
+    assert!(
+        matches!(worker.request(), ApiRequest::SendMessage { session_id, content, .. }
+        if session_id == "s1" && content == "please continue")
     );
 }
 
@@ -66,7 +63,7 @@ fn completed_session_and_other_sessions_recovery_remain_idle() {
 }
 
 #[test]
-fn already_running_or_completed_turn_suppresses_stale_recovery() {
+fn already_running_or_completed_turn_recovery_remains_idle() {
     for event in [
         ApiEvent::SessionStatus {
             session_id: "s1".into(),
@@ -92,49 +89,18 @@ fn already_running_or_completed_turn_suppresses_stale_recovery() {
 }
 
 #[test]
-fn busy_recovery_is_not_replayed_as_steering() {
+fn interruption_directives_never_replay_as_steering() {
     let worker = Worker::new(|_| vec![busy_error()]);
     worker.event(recovery_event("s1"));
-    assert!(matches!(worker.request(), ApiRequest::SendMessage { .. }));
     recovery_fence(&worker);
     assert!(
         worker.requests.try_recv().is_err(),
-        "another client's continuation is sufficient"
+        "recovery must not be replayed through steering either"
     );
 }
 
 #[test]
-fn user_submission_supersedes_automatic_continuation() {
-    let worker = Worker::new(|_| {
-        vec![ApiEvent::MessageAccepted {
-            session_id: "s1".into(),
-        }]
-    });
-    worker.send("new instructions", vec![]);
-    assert!(
-        matches!(worker.request(), ApiRequest::SendMessage { content, .. } if content == "new instructions")
-    );
-    worker.event(ApiEvent::TurnDone {
-        session_id: "s1".into(),
-        pending_soft_interrupts: None,
-    });
-    worker.event(recovery_event("s1"));
-    recovery_fence(&worker);
-    assert!(worker.requests.try_recv().is_err());
-}
-
-#[test]
-fn recovery_state_resets_for_a_new_attachment_and_rejects_empty_directives() {
-    let mut recovery = recovery::Recovery::default();
-    assert!(!recovery.claim("  ", false));
-    assert!(recovery.claim("continue", false));
-    assert!(!recovery.claim("continue", false));
-    let mut reconnected = recovery::Recovery::default();
-    assert!(reconnected.claim("continue after another crash", false));
-}
-
-#[test]
-fn explicit_cancel_or_clear_suppresses_late_recovery() {
+fn explicit_cancel_or_clear_keeps_a_late_recovery_idle() {
     for command in [
         SessionCommand::Cancel,
         SessionCommand::Operation(SessionOperation::Clear),
